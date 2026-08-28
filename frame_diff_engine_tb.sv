@@ -263,9 +263,8 @@ module frame_diff_engine_tb;
 
     // -------------------------------------------------------------------
     // Safety timeout (in case something hangs) - re-reads the same plusarg
-    // independently so it stays correct even if NUM_TESTS is overridden
-    // -------------------------------------------------------------------
-    initial begin
+    // independently so it stays correct even if NUM_TESTS is overriddenrm
+       initial begin
         int unsigned timeout_tests;
         if (!$value$plusargs("NUM_TESTS=%d", timeout_tests))
             timeout_tests = 100_000;
@@ -273,5 +272,6 @@ module frame_diff_engine_tb;
         $display("ERROR: testbench timeout - forcing finish");
         $finish;
     end
-
+ 
 endmodule
+ 
