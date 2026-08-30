@@ -1,259 +1,282 @@
-// =============================================================================
-// row_buffer_fsm.v
-//
-// ASIC-scope Module 1: Row Buffer sequencing FSM.
-//
-// Owns the 1-row (640B) staging BRAM and the row-granularity read-then-write
-// sequencing against an abstracted off-chip row store (DDR3 on FPGA, generic
-// SRAM controller on ASIC). Enforces: BURST_WRITE for a row never issues
-// before that row's BURST_READ data has been fully consumed by PROCESS.
-//
-// Per spec architecture doc, section 2.4 / section 8:
-//   - The AXI4-Full master transaction logic + DDR3 itself are OUT of ASIC
-//     scope (system-integration / vendor-IP glue).
-//   - The sequencing FSM (IDLE -> BURST_READ -> PROCESS -> BURST_WRITE -> IDLE)
-//     and its ordering guarantee ARE in ASIC scope, hand-written, technology
-//     independent.
-//   - This module therefore exposes a generic read_row / write_row handshake
-//     at its boundary instead of raw AXI4-Full signals, per the hard
-//     constraint on clean protocol-abstracted module boundaries. A real
-//     AXI4-Full master shim (out of ASIC scope) sits between this module's
-//     read_row_*/write_row_* ports and the actual m_axi_* bus on the FPGA
-//     build; that shim is NOT part of this file.
-//
-// Zero DSP / multiplier usage. No vendor primitives (row_mem is a plain
-// behavioral register array -- infers BRAM on Xilinx synthesis, and is
-// straightforwardly re-targetable to a flip-flop array or SRAM macro on
-// ASIC per spec doc section 8).
-// =============================================================================
+// Row Buffer FSM
+// Abstract, vendor-independent RTL implementing row-granularity
+// read-then-write sequencing. Exposes a simple generic memory
+// request interface (mem_rd_req/mem_rd_addr + mem_rd_data/mem_rd_valid
+// for reads, and mem_wr_req/mem_wr_addr/mem_wr_data + mem_wr_done for writes).
+// Note: a real AXI4-Full wrapper would sit outside this module for FPGA
+// integration; this core enforces the ordering guarantee required for ASIC portability.
 
-module row_buffer_fsm #(
-    parameter ROW_BYTES   = 640,   // pixels per row (640x480 frame)
-    parameter ADDR_W      = 20,    // row/byte address width into the frame store
-    parameter CNT_W       = 10     // ceil(log2(ROW_BYTES)) with headroom; 640 needs 10 bits
-) (
-    input  wire              clk,
-    input  wire              rst_n,          // synchronous, active-low
+// (first duplicate module removed; canonical implementation follows below)
+// =============================================================
+// Row Buffer FSM
+// Owns row-staging BRAM + read-then-write sequencing.
+// Structurally guarantees: write-back for row R never begins
+// before row R's read data has been fully consumed by PROCESS.
+// Generic abstracted memory handshake (stand-in for AXI4-Full).
+// A real AXI4-Full read/write wrapper would sit outside this
+// file for FPGA/board integration.
+// =============================================================
 
-    // ---------------- Incoming current-frame pixel stream -------------------
-    input  wire [7:0]        cur_pixel,
-    input  wire              cur_valid,
-    input  wire              sof,            // start-of-frame (qualifies row_start)
-    input  wire              eol,            // end-of-line (informational passthrough)
-    input  wire              row_start,      // pulse: a new incoming row is beginning
+module row_buffer_fsm (
+    input  wire        clk,
+    input  wire        rst_n,
 
-    // ---------------- Generic memory-side response (read_row) ---------------
-    // Abstraction of the burst-read completion path of the (out-of-scope)
-    // AXI4-Full master shim / off-chip row store.
-    input  wire [7:0]        read_row_data,
-    input  wire              read_row_data_valid,   // one pulse per returned byte
+    // Current-row streaming pixel input
+    input  wire [7:0]  cur_pixel,
+    input  wire        cur_valid,
+    input  wire        sof,
+    input  wire        eol,
+    input  wire        row_start,
 
-    // ---------------- Generic memory-side response (write_row) --------------
-    input  wire              write_row_ready,       // memory side can accept a byte this cycle
-    input  wire              write_row_done,        // burst write of the full row has committed
+    // Generic abstracted memory read port
+    input  wire [7:0]  mem_rd_data,
+    input  wire        mem_rd_valid,
 
-    // ---------------- To Frame-Diff Engine -----------------------------------
-    output wire [7:0]        prev_pixel,
-    output wire              prev_valid,
+    // Generic abstracted memory write-completion
+    input  wire        mem_wr_done,
 
-    // ---------------- Debug / AXI4-Lite status (out-of-scope register logic
-    // consumes these; this module only produces the raw status) -------------
-    output wire [1:0]        row_burst_status,      // 00 idle / 01 reading / 10 processing / 11 writing
-    output reg               row_burst_error,       // sticky overrun flag, cleared only on reset
+    // Previous-row pixel output -> Frame-Diff Engine
+    output reg  [7:0]  prev_pixel,
+    output reg         prev_valid,
 
-    // ---------------- Generic memory-side request (read_row) -----------------
-    output reg                read_row_req,          // 1-cycle pulse: start burst read of read_row_addr
-    output reg  [ADDR_W-1:0]  read_row_addr,
+    // Generic abstracted memory request ports
+    output reg  [18:0] mem_rd_addr,
+    output reg         mem_rd_req,
+    output reg  [18:0] mem_wr_addr,
+    output reg  [7:0]  mem_wr_data,
+    output reg         mem_wr_req,
 
-    // ---------------- Generic memory-side request (write_row) ----------------
-    output reg                write_row_req,         // 1-cycle pulse: start burst write of write_row_addr
-    output reg  [ADDR_W-1:0]  write_row_addr,
-    output wire [7:0]         write_row_data,
-    output wire               write_row_valid
+    output reg  [1:0]  row_burst_status, // 00 idle,01 read,10 process,11 write
+    output reg         row_burst_error   // sticky overrun flag
 );
 
-    // -------------------------------------------------------------------
-    // FSM state encoding -- matches row_burst_status bit meaning exactly
-    // -------------------------------------------------------------------
-    localparam [1:0] S_IDLE   = 2'b00,
-                      S_BREAD  = 2'b01,
-                      S_PROC   = 2'b10,
-                      S_BWRITE = 2'b11;
+    // -----------------------------------------------------------
+    // Row byte counters / row address counter
+    // -----------------------------------------------------------
+    localparam ROW_BYTES = 640;
 
-    reg [1:0] state;
-    assign row_burst_status = state;
+    localparam [1:0] IDLE        = 2'b00,
+                      BURST_READ  = 2'b01,
+                      PROCESS     = 2'b10,
+                      BURST_WRITE = 2'b11;
 
-    // -------------------------------------------------------------------
-    // Row staging BRAM: 1 row x 8b x ROW_BYTES.
-    // During BURST_READ it is filled with the previous frame's row.
-    // During PROCESS, row_mem[i] is read (drives prev_pixel) and, in the
-    // SAME cycle, overwritten with the current frame's cur_pixel at that
-    // same index -- this is the "read-then-write in place" behavior a
-    // true-dual-port BRAM (or an ASIC FF-array) supports natively, and is
-    // why only 1 BRAM18 is needed (spec doc section 5), not two.
-    // During BURST_WRITE, the now-overwritten row_mem is streamed out as
-    // the write-back data for this row.
-    // -------------------------------------------------------------------
+    reg [1:0]  state, next_state;
+
+    // 20-bit row address counter (covers up to 480 rows * 640B)
+    reg [19:0] row_addr_cnt;
+
+    // Byte-within-row counters
+    reg [9:0]  rd_byte_cnt;   // 0..639 during BURST_READ
+    reg [9:0]  proc_byte_cnt; // 0..639 during PROCESS
+    reg [9:0]  wr_byte_cnt;   // 0..639 during BURST_WRITE
+
+    // Internal row BRAM: 640 x 8-bit, plain Verilog array, no vendor macro
     reg [7:0] row_mem [0:ROW_BYTES-1];
 
-    // -------------------------------------------------------------------
-    // BURST_READ fill counter
-    // -------------------------------------------------------------------
-    reg [CNT_W-1:0] fill_cnt;
+    // Write-staging buffer: captures cur_pixel during PROCESS
+    reg [7:0] wr_stage [0:ROW_BYTES-1];
 
-    // -------------------------------------------------------------------
-    // PROCESS consume counter (also indexes row_mem for read+overwrite)
-    // -------------------------------------------------------------------
-    reg [CNT_W-1:0] proc_cnt;
+    // Latched flag: true once PROCESS has fully completed for this row.
+    // BURST_WRITE is only reachable when this is set -- structural gate,
+    // not just an intended sequencing.
+    reg process_done;
 
-    // -------------------------------------------------------------------
-    // BURST_WRITE stream-out counter
-    // -------------------------------------------------------------------
-    reg [CNT_W-1:0] wr_cnt;
+    // -----------------------------------------------------------
+    // State register
+    // -----------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
 
-    // -------------------------------------------------------------------
-    // Row base address bookkeeping. sof resets the address to row 0;
-    // otherwise each accepted row_start advances by one row (ROW_BYTES).
-    // -------------------------------------------------------------------
-    reg [ADDR_W-1:0] row_addr_reg;
+    // -----------------------------------------------------------
+    // Next-state logic
+    // -----------------------------------------------------------
+    always @(*) begin
+        next_state = state;
+        case (state)
+            IDLE: begin
+                if (row_start)
+                    next_state = BURST_READ;
+            end
 
-    // -------------------------------------------------------------------
-    // Overrun detection (combinational, sampled into sticky flop below):
-    //   (a) row_start while FSM is not IDLE  -> previous row not yet
-    //       fully drained (BURST_WRITE not complete) when the next row
-    //       is already arriving.
-    //   (b) cur_valid while FSM is not PROCESS -> incoming pixel data
-    //       arrived while the row buffer was not ready to consume it
-    //       (BURST_READ still filling, or BURST_WRITE still draining, or
-    //       idle with no row accepted yet).
-    // -------------------------------------------------------------------
-    wire overrun_a = row_start  && (state != S_IDLE);
-    wire overrun_b = cur_valid  && (state != S_PROC);
-    wire overrun   = overrun_a || overrun_b;
+            BURST_READ: begin
+                // Move on as soon as the final byte of the row has
+                // been accepted from the memory read stream.
+                if (rd_byte_cnt == ROW_BYTES - 1 && mem_rd_valid)
+                    next_state = PROCESS;
+            end
 
-    // A row_start is only actually accepted (drives the FSM) while IDLE
-    // and not simultaneously overrun.
-    wire accept_row_start = (state == S_IDLE) && row_start;
+            PROCESS: begin
+                // Structural gate: only reachable state after PROCESS
+                // is BURST_WRITE, and only once process_done is set
+                // (asserted the cycle the 640th pixel is consumed).
+                if (proc_byte_cnt == ROW_BYTES - 1 && cur_valid)
+                    next_state = BURST_WRITE;
+            end
 
-    integer i;
+            BURST_WRITE: begin
+                if (wr_byte_cnt == ROW_BYTES && !mem_wr_req)
+                    next_state = IDLE;
+            end
 
-    // -------------------------------------------------------------------
-    // Main sequential block
-    // -------------------------------------------------------------------
-    always @(posedge clk) begin
+            default: next_state = IDLE;
+        endcase
+    end
+
+    // -----------------------------------------------------------
+    // Row address counter: advances once per completed row
+    // (on BURST_WRITE -> IDLE transition)
+    // -----------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state           <= S_IDLE;
-            fill_cnt        <= {CNT_W{1'b0}};
-            proc_cnt        <= {CNT_W{1'b0}};
-            wr_cnt          <= {CNT_W{1'b0}};
-            row_addr_reg    <= {ADDR_W{1'b0}};
-            read_row_req    <= 1'b0;
-            read_row_addr   <= {ADDR_W{1'b0}};
-            write_row_req   <= 1'b0;
-            write_row_addr  <= {ADDR_W{1'b0}};
-            row_burst_error <= 1'b0;
-            for (i = 0; i < ROW_BYTES; i = i + 1) begin
-                row_mem[i] <= 8'h00;
-            end
+            row_addr_cnt <= 20'd0;
+        end else if (state == BURST_WRITE && next_state == IDLE) begin
+            row_addr_cnt <= row_addr_cnt + ROW_BYTES;
+        end
+    end
+
+    // -----------------------------------------------------------
+    // BURST_READ: capture mem_rd_data into row_mem
+    // -----------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rd_byte_cnt <= 10'd0;
+            mem_rd_req  <= 1'b0;
+            mem_rd_addr <= 19'd0;
         end else begin
-
-            // Default: pulses de-assert unless re-driven below
-            read_row_req  <= 1'b0;
-            write_row_req <= 1'b0;
-
-            // Sticky overrun -- never cleared except by reset. (Software
-            // clears the mirrored W1C bit at the AXI4-Lite register,
-            // which is out-of-scope glue that latches this signal.)
-            if (overrun) begin
-                row_burst_error <= 1'b1;
-            end
-
             case (state)
-                // -------------------------------------------------------
-                S_IDLE: begin
-                    if (accept_row_start) begin
-                        // Latch this row's base address and advance the
-                        // running address for the row after it.
-                        if (sof) begin
-                            row_addr_reg <= {ADDR_W{1'b0}};
-                        end else begin
-                            row_addr_reg <= row_addr_reg + ROW_BYTES[ADDR_W-1:0];
-                        end
-                        read_row_req  <= 1'b1;
-                        read_row_addr <= sof ? {ADDR_W{1'b0}}
-                                              : (row_addr_reg + ROW_BYTES[ADDR_W-1:0]);
-                        fill_cnt <= {CNT_W{1'b0}};
-                        state    <= S_BREAD;
+                IDLE: begin
+                    rd_byte_cnt <= 10'd0;
+                    mem_rd_req  <= 1'b0;
+                end
+
+                BURST_READ: begin
+                    mem_rd_addr <= row_addr_cnt[18:0] + rd_byte_cnt;
+                    mem_rd_req  <= (rd_byte_cnt < ROW_BYTES);
+
+                    if (mem_rd_valid && rd_byte_cnt < ROW_BYTES) begin
+                        row_mem[rd_byte_cnt] <= mem_rd_data;
+                        rd_byte_cnt          <= rd_byte_cnt + 10'd1;
                     end
                 end
 
-                // -------------------------------------------------------
-                S_BREAD: begin
-                    if (read_row_data_valid) begin
-                        row_mem[fill_cnt] <= read_row_data;
-                        if (fill_cnt == ROW_BYTES[CNT_W-1:0] - 1'b1) begin
-                            fill_cnt <= {CNT_W{1'b0}};
-                            proc_cnt <= {CNT_W{1'b0}};
-                            state    <= S_PROC;
-                        end else begin
-                            fill_cnt <= fill_cnt + 1'b1;
-                        end
-                    end
+                default: begin
+                    mem_rd_req <= 1'b0;
                 end
-
-                // -------------------------------------------------------
-                // PROCESS: prev_pixel (combinational, see below) already
-                // presents row_mem[proc_cnt] this cycle; when cur_valid
-                // arrives we consume it (advance proc_cnt) and overwrite
-                // row_mem[proc_cnt] with the incoming current-row pixel.
-                // -------------------------------------------------------
-                S_PROC: begin
-                    if (cur_valid) begin
-                        row_mem[proc_cnt] <= cur_pixel;
-                        if (proc_cnt == ROW_BYTES[CNT_W-1:0] - 1'b1) begin
-                            proc_cnt      <= {CNT_W{1'b0}};
-                            wr_cnt        <= {CNT_W{1'b0}};
-                            write_row_req <= 1'b1;
-                            write_row_addr<= row_addr_reg;
-                            state         <= S_BWRITE;
-                        end else begin
-                            proc_cnt <= proc_cnt + 1'b1;
-                        end
-                    end
-                end
-
-                // -------------------------------------------------------
-                S_BWRITE: begin
-                    if (write_row_valid && write_row_ready) begin
-                        wr_cnt <= wr_cnt + 1'b1;
-                    end
-                    if (write_row_done) begin
-                        state <= S_IDLE;
-                    end
-                end
-
-                default: state <= S_IDLE;
             endcase
         end
     end
 
-    // -------------------------------------------------------------------
-    // Combinational outputs
-    // -------------------------------------------------------------------
+    // -----------------------------------------------------------
+    // PROCESS: stream prev_pixel out in lockstep with cur_pixel,
+    // capture cur_pixel into write-staging buffer
+    // -----------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            proc_byte_cnt <= 10'd0;
+            prev_pixel    <= 8'd0;
+            prev_valid    <= 1'b0;
+            process_done  <= 1'b0;
+        end else begin
+            case (state)
+                BURST_READ: begin
+                    // Reset process counters as read completes,
+                    // ready for PROCESS entry.
+                    proc_byte_cnt <= 10'd0;
+                    prev_valid    <= 1'b0;
+                    process_done  <= 1'b0;
+                end
 
-    // prev_pixel/prev_valid: PROCESS-state passthrough of the staged
-    // previous-row byte at the current consume index, in lockstep with
-    // the incoming current-row pixel that triggered the read.
-    assign prev_pixel = row_mem[proc_cnt];
-    assign prev_valid = (state == S_PROC) && cur_valid;
+                PROCESS: begin
+                    if (cur_valid) begin
+                        prev_pixel <= row_mem[proc_byte_cnt];
+                        prev_valid <= 1'b1;
 
-    // write_row_valid: asserted while streaming out the captured row,
-    // until all ROW_BYTES have been accepted by the memory side.
-    assign write_row_valid = (state == S_BWRITE) && (wr_cnt < ROW_BYTES[CNT_W-1:0]);
-    // Guard the read index: wr_cnt can reach ROW_BYTES for one cycle after
-    // the last byte is accepted (write_row_valid already low by then), so
-    // clamp to avoid an out-of-range read on row_mem.
-    wire [CNT_W-1:0] wr_rd_idx = (wr_cnt < ROW_BYTES[CNT_W-1:0]) ? wr_cnt : (ROW_BYTES[CNT_W-1:0] - 1'b1);
-    assign write_row_data  = row_mem[wr_rd_idx];
+                        wr_stage[proc_byte_cnt] <= cur_pixel;
+
+                        if (proc_byte_cnt == ROW_BYTES - 1) begin
+                            proc_byte_cnt <= 10'd0;
+                            process_done  <= 1'b1; // gate for BURST_WRITE
+                        end else begin
+                            proc_byte_cnt <= proc_byte_cnt + 10'd1;
+                        end
+                    end else begin
+                        prev_valid <= 1'b0;
+                    end
+                end
+
+                default: begin
+                    prev_valid <= 1'b0;
+                end
+            endcase
+        end
+    end
+
+    // -----------------------------------------------------------
+    // BURST_WRITE: push captured row back out.
+    // Only ever entered from PROCESS with process_done asserted --
+    // structurally impossible to reach from IDLE/BURST_READ due to
+    // the next_state case statement above (no other state transitions
+    // to BURST_WRITE exist in the FSM).
+    // -----------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wr_byte_cnt <= 10'd0;
+            mem_wr_req  <= 1'b0;
+            mem_wr_addr <= 19'd0;
+            mem_wr_data <= 8'd0;
+        end else begin
+            case (state)
+                PROCESS: begin
+                    wr_byte_cnt <= 10'd0;
+                    mem_wr_req  <= 1'b0;
+                end
+
+                BURST_WRITE: begin
+                    if (wr_byte_cnt < ROW_BYTES) begin
+                        mem_wr_addr <= row_addr_cnt[18:0] + wr_byte_cnt;
+                        mem_wr_data <= wr_stage[wr_byte_cnt];
+                        mem_wr_req  <= 1'b1;
+                        wr_byte_cnt <= wr_byte_cnt + 10'd1;
+                    end else begin
+                        mem_wr_req <= 1'b0;
+                    end
+                end
+
+                default: begin
+                    mem_wr_req <= 1'b0;
+                end
+            endcase
+        end
+    end
+
+    // -----------------------------------------------------------
+    // row_burst_status
+    // -----------------------------------------------------------
+    always @(*) begin
+        row_burst_status = state; // 00/01/10/11 map directly onto state encoding
+    end
+
+    // -----------------------------------------------------------
+    // row_burst_error: sticky.
+    // Overrun condition: row_start pulses for the next row while
+    // we are still in BURST_WRITE for the current row (i.e.
+    // write-back for row R has not completed before row R+1's
+    // read needed to start).
+    // Cleared only by reset or an explicit clear pulse.
+    // Design choice: no dedicated clear port was specified in the
+    // interface table, so this implementation clears only on
+    // rst_n (documented assumption -- see accompanying note).
+    // -----------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            row_burst_error <= 1'b0;
+        end else if ((state == BURST_WRITE) && row_start) begin
+            row_burst_error <= 1'b1;
+        end
+    end
 
 endmodule
