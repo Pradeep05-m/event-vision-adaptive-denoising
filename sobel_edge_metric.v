@@ -77,19 +77,17 @@ module sobel_edge_metric #(
                     a21 = (row_cnt+1 < MAX_ROW && col_cnt >= 0)   ? gray_mem[row_cnt+1][col_cnt]   : 8'd0;
                     a22 = (row_cnt+1 < MAX_ROW && col_cnt+1 < FRAME_WIDTH) ? gray_mem[row_cnt+1][col_cnt+1] : 8'd0;
 
-                    gx = (-$signed(8'(a00)))
-                       - (2 * $signed(8'(a10)))
-                       - $signed(8'(a20))
-                       + $signed(8'(a02))
-                       + (2 * $signed(8'(a12)))
-                       + $signed(8'(a22));
-
-                    gy = (-$signed(8'(a00)))
-                       - (2 * $signed(8'(a01)))
-                       - $signed(8'(a02))
-                       + $signed(8'(a20))
-                       + (2 * $signed(8'(a21)))
-                       + $signed(8'(a22));
+                    // Note: a00..a22 are `integer` (32-bit, signed by default in
+                    // Verilog) and only ever hold 0..255 (from unsigned 8-bit
+                    // gray_mem taps or the 8'd0 boundary-padding constant), so no
+                    // explicit $signed()/width-cast is needed here. The original
+                    // `$signed(8'(a00))` form used a SystemVerilog-2005+ sized-cast
+                    // ( 8'(...) ), which Vivado's default Verilog-2001 `.v` parser
+                    // does not support -- that mismatch was the actual syntax error,
+                    // not a logic bug. Plain integer arithmetic below is equivalent
+                    // and Verilog-2001-clean.
+                    gx = (-a00) - (2 * a10) - a20 + a02 + (2 * a12) + a22;
+                    gy = (-a00) - (2 * a01) - a02 + a20 + (2 * a21) + a22;
 
                     abs_gx = (gx < 0) ? (-gx) : gx;
                     abs_gy = (gy < 0) ? (-gy) : gy;
