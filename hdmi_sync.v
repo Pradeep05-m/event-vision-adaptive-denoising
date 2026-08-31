@@ -1,4 +1,4 @@
-// hdmi_sync_to_handshake.v
+// /hdmi_sync_to_handshake.v
 // Derives the valid/sof/eol/row_start handshake signals your pipeline expects
 // from a standard HDMI receiver's data-enable (DE) and vertical-sync (VSYNC)
 // outputs. Cycle-aligned: outputs are valid combinationally in the same cycle
