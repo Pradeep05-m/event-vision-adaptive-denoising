@@ -1,18 +1,21 @@
 // hdmi_sync_to_handshake.v
-// Derives the valid/sof/eol handshake signals your pipeline expects
-// (rgb2gray.rgb_valid/rgb_sof/rgb_eol) from a standard HDMI receiver's
-// data-enable (DE) and vertical-sync (VSYNC) outputs. Cycle-aligned:
-// outputs are valid combinationally in the same cycle as the corresponding
-// pixel's DE, so they can be wired straight into rgb2gray alongside
-// dvi2rgb's RGB data output -- no extra pipeline delay introduced here.
+// Derives the valid/sof/eol/row_start handshake signals your pipeline expects
+// from a standard HDMI receiver's data-enable (DE) and vertical-sync (VSYNC)
+// outputs. Cycle-aligned: outputs are valid combinationally in the same cycle
+// as the corresponding pixel's DE, so they can be wired straight into
+// rgb2gray/row_buffer_fsm alongside dvi2rgb's RGB data output -- no extra
+// pipeline delay introduced here.
 //
-// sof: pulses for exactly one cycle, on the first active (DE=1) pixel
-//      following a rising edge of VSYNC (i.e. the first pixel of a new frame).
-// eol: pulses for exactly one cycle, on the last active pixel of each
-//      video line (column index == FRAME_WIDTH-1), detected via an
-//      active-pixel counter that free-runs during DE and resets during
-//      horizontal blanking (DE=0).
-// valid: passthrough of DE.
+// sof:       pulses for exactly one cycle, on the first active (DE=1) pixel
+//            following a rising edge of VSYNC (i.e. the first pixel of a new frame).
+// eol:       pulses for exactly one cycle, on the last active pixel of each
+//            video line (column index == FRAME_WIDTH-1).
+// row_start: pulses for exactly one cycle, on the first active pixel of
+//            EVERY line (per event_denoising_architecture.md / row_buffer_fsm
+//            spec: "pulsed once at the start of each incoming line" -- this is
+//            per-row, not per-frame). A frame's first row's first pixel
+//            asserts sof and row_start simultaneously.
+// valid:     passthrough of DE.
 //
 // Assumes DE, VSYNC, and pixel data from the HDMI RX IP are already
 // cycle-aligned (true for dvi2rgb / v_hdmi_rx_ss outputs) -- this module
@@ -30,7 +33,8 @@ module hdmi_sync_to_handshake #(
 
     output reg         valid,
     output reg         sof,
-    output reg         eol
+    output reg         eol,
+    output reg         row_start
 );
 
     localparam integer COL_W = $clog2(FRAME_WIDTH);
@@ -47,6 +51,7 @@ module hdmi_sync_to_handshake #(
             valid         <= 1'b0;
             sof           <= 1'b0;
             eol           <= 1'b0;
+            row_start     <= 1'b0;
         end else begin
             vsync_d <= vsync;
             valid   <= de;
@@ -61,9 +66,15 @@ module hdmi_sync_to_handshake #(
                 if (frame_pending)
                     frame_pending <= 1'b0;
 
-                // eol: col_cnt (registered from the previous active pixel,
-                // or 0 if this is the first pixel of the line) already holds
-                // the correct 0-based index for THIS pixel
+                // row_start: this is the first active pixel of ANY line --
+                // true whenever col_cnt (registered from the previous active
+                // pixel, or 0 at the start of a fresh line) is still at 0.
+                // This fires every row, including the frame's first row
+                // (where it coincides with sof).
+                row_start <= (col_cnt == {COL_W{1'b0}});
+
+                // eol: col_cnt already holds the correct 0-based index for
+                // THIS pixel (registered from the previous active pixel)
                 eol <= (col_cnt == FRAME_WIDTH-1);
 
                 // advance counter for the next active pixel; wraps at end of line
@@ -73,9 +84,10 @@ module hdmi_sync_to_handshake #(
                     col_cnt <= col_cnt + 1'b1;
             end else begin
                 // horizontal blanking: hold counter at 0, ready for next line
-                col_cnt <= {COL_W{1'b0}};
-                sof     <= 1'b0;
-                eol     <= 1'b0;
+                col_cnt   <= {COL_W{1'b0}};
+                sof       <= 1'b0;
+                eol       <= 1'b0;
+                row_start <= 1'b0;
             end
         end
     end

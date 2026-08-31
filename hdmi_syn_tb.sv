@@ -11,11 +11,11 @@ module hdmi_sync_tb;
 
     reg clk, rst_n;
     reg de, vsync;
-    wire valid, sof, eol;
+    wire valid, sof, eol, row_start;
 
     hdmi_sync_to_handshake #(.FRAME_WIDTH(FRAME_WIDTH)) dut (
         .pixel_clk(clk), .rst_n(rst_n), .de(de), .vsync(vsync),
-        .valid(valid), .sof(sof), .eol(eol)
+        .valid(valid), .sof(sof), .eol(eol), .row_start(row_start)
     );
 
     initial clk = 0;
@@ -23,12 +23,12 @@ module hdmi_sync_tb;
 
     integer h, v;
     integer errors, checks;
-    integer sof_count, eol_count;
+    integer sof_count, eol_count, row_start_count;
     integer col_within_line;
     reg     expect_sof_next_de;
 
     initial begin
-        errors = 0; checks = 0; sof_count = 0; eol_count = 0;
+        errors = 0; checks = 0; sof_count = 0; eol_count = 0; row_start_count = 0;
         rst_n = 0; de = 0; vsync = 0;
         repeat (4) @(posedge clk);
         rst_n = 1;
@@ -91,6 +91,26 @@ module hdmi_sync_tb;
                             $display("ERROR: unexpected eol at v=%0d h=%0d", v, h);
                         end
                     end
+
+                    // row_start must fire on the first active pixel of EVERY
+                    // line (col_within_line==0), including the frame's first
+                    // row where it coincides with sof -- distinct from sof,
+                    // which only fires once per frame.
+                    if (col_within_line == 0) begin
+                        checks = checks + 1;
+                        if (row_start !== 1'b1) begin
+                            errors = errors + 1;
+                            $display("ERROR: row_start missing at line start, v=%0d h=%0d", v, h);
+                        end else begin
+                            row_start_count = row_start_count + 1;
+                        end
+                    end else begin
+                        checks = checks + 1;
+                        if (row_start !== 1'b0) begin
+                            errors = errors + 1;
+                            $display("ERROR: unexpected row_start at v=%0d h=%0d", v, h);
+                        end
+                    end
                 end else begin
                     checks = checks + 1;
                     if (valid !== 1'b0) begin
@@ -105,8 +125,8 @@ module hdmi_sync_tb;
         @(posedge clk);
 
         $display("--------------------------------------------------");
-        $display("HDMI_SYNC_TB DIRECTED: checks=%0d errors=%0d sof_count=%0d eol_count=%0d (expect sof_count=1, eol_count=%0d)",
-                   checks, errors, sof_count, eol_count, V_TOTAL);
+        $display("HDMI_SYNC_TB DIRECTED: checks=%0d errors=%0d sof_count=%0d eol_count=%0d row_start_count=%0d (expect sof_count=1, eol_count=%0d, row_start_count=%0d)",
+                   checks, errors, sof_count, eol_count, row_start_count, V_TOTAL, V_TOTAL);
         $display("--------------------------------------------------");
 
         // ================= randomized regression, fixed seed =================
@@ -176,6 +196,21 @@ module hdmi_sync_tb;
                                 $display("ERROR(rand): unexpected eol, frame=%0d line=%0d col=%0d", f, line, hh);
                             end
                         end
+
+                        checks = checks + 1;
+                        if (hh == 0) begin
+                            if (row_start !== 1'b1) begin
+                                errors = errors + 1;
+                                $display("ERROR(rand): row_start missing at line start, frame=%0d line=%0d col=%0d", f, line, hh);
+                            end else begin
+                                row_start_count = row_start_count + 1;
+                            end
+                        end else begin
+                            if (row_start !== 1'b0) begin
+                                errors = errors + 1;
+                                $display("ERROR(rand): unexpected row_start, frame=%0d line=%0d col=%0d", f, line, hh);
+                            end
+                        end
                     end
 
                     // horizontal blanking: random length, de=0
@@ -197,7 +232,7 @@ module hdmi_sync_tb;
         end
 
         $display("--------------------------------------------------");
-        $display("HDMI_SYNC_TB TOTAL: seed=%0d, checks=%0d, errors=%0d", SEED, checks, errors);
+        $display("HDMI_SYNC_TB TOTAL: seed=%0d, checks=%0d, errors=%0d, row_start_count=%0d", SEED, checks, errors, row_start_count);
         if (errors == 0)
             $display("RESULT: PASS");
         else
